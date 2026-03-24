@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # Tested successfully on the hiyouga/verl:ngc-th2.6.0-cu126-vllm0.8.4-flashinfer0.2.2-cxx11abi0 image.
 # It outperforms the Qwen2 7B base model by two percentage points on the test set of GSM8K.
 # export NCCL_P2P_DISABLE=1       # 禁用 NVLink
@@ -5,21 +7,24 @@
 # export NCCL_NET_GDR_LEVEL=0     # 禁用 GDR（GPU直连）
 # export CUDA_VISIBLE_DEVICES=4,5,6,7
 
-# ================================
-# 注意：如果你不能直接访问huggingface，可以直接下载huggingface数据集及模型到指定目录，然后执行本脚本完成数据预处理：
-# * Dataset:
-# heyingzhi/Amazon_new --> ./data/Amazon
-# * Checkpoints:
-# heyingzhi/e2e-AmazonMix3-EP1_reasoning-activate-ep1 --> ./saved_ckpt/e2e-AmazonMix3-EP1_reasoning-activate-ep1
+set -euo pipefail
+set -x
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # ================================
 # Note: please change the number of GPUs and nodes according to your setup.
 # ================================
 n_gpus_per_node=4
 nnodes=1
+experiment_name="Office_Products_stage3_rl_Qwen3-1.7B"
+stage2_checkpoint="./output_dir/Office_Products_stage2_reasoning_activation_Qwen3-1.7B/final_checkpoint"
+log_file="./logs/${experiment_name}.log"
 # ================================
 
-set -e
-set -x
+mkdir -p ./logs
+
 {
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -30,7 +35,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_response_length=1024 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
-    actor_rollout_ref.model.path=/home/yingzhi/rec/MiniOneRec/output_dir/reasoning-activation_7Task_Qwen3-1.7B-EP1_Amazon_mix3_IOV/checkpoint-122 \
+    actor_rollout_ref.model.path="${stage2_checkpoint}" \
     actor_rollout_ref.actor.optim.lr=5e-7 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
@@ -52,13 +57,13 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    custom_reward_function.path="./verl/utils/reward_score/direct_recommendation_StepRule_Office_Products.py" \
+    custom_reward_function.path="./verl/utils/reward_score/direct_recommendation_StepRule_Office.py" \
     custom_reward_function.name="rule_base_reward" \
     trainer.project_name='RecRL_Reasoning' \
-    trainer.experiment_name='Qwen3-1.7B_base_e2e-Office_Products_reasoning-activate-ep1' \
+    trainer.experiment_name="${experiment_name}" \
     trainer.n_gpus_per_node=$n_gpus_per_node \
     trainer.nnodes=$nnodes \
     trainer.save_freq=100 \
     trainer.test_freq=50 \
-    trainer.total_epochs=10 $@
-} > ./logs/Qwen3-1.7B_base_e2e-Office_Products-EP1_reasoning-activate-ep1.log 2>&1
+    trainer.total_epochs=10 "$@"
+} > "${log_file}" 2>&1

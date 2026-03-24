@@ -181,17 +181,17 @@ def get_cosine_schedule_with_warmup(
 
 def train(
     # model/data params
-    base_model: str = "/home/yingzhi/huggingface_data/hub/Qwen3-1.7B",  # update to real checkpoint when running
-    train_file: str = "./data/Amazon/train/Industrial_and_Scientific_5_2016-10-2018-11.csv",
-    eval_file: str = "./data/Amazon/valid/Industrial_and_Scientific_5_2016-10-2018-11.csv",
-    output_dir: str = "output_dir/TEST_sft_freeze_Qwen3",
+    base_model: str = "Qwen/Qwen3-1.7B",
+    train_file: str = "./data/Amazon/train/Office_Products_5_2016-10-2018-11.csv",
+    eval_file: str = "./data/Amazon/valid/Office_Products_5_2016-10-2018-11.csv",
+    output_dir: str = "./output_dir/Office_Products_stage1_sft_Qwen3-1.7B",
     sample: int = -1,
     seed: int = 42,
-    category: str = "Industrial_and_Scientific",
+    category: str = "Office_Products",
     
     # training hyperparams
     batch_size: int = 1024,
-    micro_batch_size: int = 4,
+    micro_batch_size: int = 1,
     num_epochs: int = 10,
     learning_rate: float = 3e-4,
     cutoff_len: int = 1024,
@@ -199,14 +199,14 @@ def train(
     group_by_length: bool = False,  # faster, but produces an odd training loss curve
     # wandb params
     wandb_project: str = "MiniOneRec",
-    wandb_run_name: str = "TEST_sft_freeze_Qwen3",
+    wandb_run_name: str = "Office_Products_stage1_sft_Qwen3-1.7B",
     resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
     train_from_scratch: bool = False,
-    sid_index_path: str = None,
-    item_meta_path: str = None,
-    llm_generated_data_path: str = None,
-    llm_generated_sequence_path: str = None,
-    general_reasoning_path: str = None,
+    sid_index_path: str = "./data/Amazon/index/Office_Products.index.json",
+    item_meta_path: str = "./data/Amazon/index/Office_Products.item.json",
+    llm_generated_data_path: str = "./data/Amazon/index/Office_Products.item_enhanced_v2.json",
+    llm_generated_sequence_path: str = "./data/Amazon/index/Office_Products.integrated_narrative.csv",
+    general_reasoning_path: str = "./data/Amazon/general/sampled_data.arrow",
     mask_assistant: bool = True,   # Whether only the target response is used for loss calculation
     train_new_token_embeddings_only: bool = False,
 ):
