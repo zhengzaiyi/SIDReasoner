@@ -119,6 +119,7 @@ class AdvantageEstimator(str, Enum):
 
     GAE = "gae"
     GRPO = "grpo"
+    GRPO_STEP_ALIGNED = "grpo_step_aligned"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -306,6 +307,102 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+def _normalize_step_aligned_sequence(value) -> list[float] | list[int]:
+    if value is None:
+        return []
+    if isinstance(value, np.ndarray):
+        return _normalize_step_aligned_sequence(value.tolist())
+    if isinstance(value, torch.Tensor):
+        return _normalize_step_aligned_sequence(value.detach().cpu().tolist())
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+@register_adv_est(AdvantageEstimator.GRPO_STEP_ALIGNED)
+def compute_grpo_step_aligned_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    step_rewards,
+    think_end_positions,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Group-relative step-wise normalization with token-level think-span assignment."""
+
+    del token_level_rewards
+    del kwargs
+
+    device = response_mask.device
+    batch_size, response_length = response_mask.shape
+
+    normalized_step_rewards = [
+        [float(score) for score in _normalize_step_aligned_sequence(sample_rewards)]
+        for sample_rewards in step_rewards
+    ]
+    normalized_think_end_positions = [
+        [int(position) for position in _normalize_step_aligned_sequence(sample_positions)]
+        for sample_positions in think_end_positions
+    ]
+
+    max_steps = max((len(sample_rewards) for sample_rewards in normalized_step_rewards), default=0)
+    if max_steps == 0:
+        zeros = torch.zeros_like(response_mask, dtype=torch.float32)
+        return zeros, zeros
+
+    step_reward_tensor = torch.zeros((batch_size, max_steps), dtype=torch.float32, device=device)
+    for sample_idx, sample_rewards in enumerate(normalized_step_rewards):
+        if sample_rewards:
+            step_reward_tensor[sample_idx, : len(sample_rewards)] = torch.tensor(
+                sample_rewards,
+                dtype=torch.float32,
+                device=device,
+            )
+
+    id2indices = defaultdict(list)
+    for sample_idx in range(batch_size):
+        id2indices[index[sample_idx]].append(sample_idx)
+
+    step_advantages = torch.zeros_like(step_reward_tensor)
+    with torch.no_grad():
+        for sample_indices in id2indices.values():
+            group_rewards = step_reward_tensor[sample_indices]
+            if len(sample_indices) == 1:
+                step_advantages[sample_indices[0]] = group_rewards[0]
+                continue
+
+            mean = group_rewards.mean(dim=0, keepdim=True)
+            centered = group_rewards - mean
+            if norm_adv_by_std_in_grpo:
+                std = group_rewards.std(dim=0, keepdim=True).clamp(min=epsilon)
+                centered = centered / std
+            step_advantages[sample_indices] = centered
+
+    advantages = torch.zeros_like(response_mask, dtype=torch.float32)
+    returns = torch.zeros_like(response_mask, dtype=torch.float32)
+    for sample_idx in range(batch_size):
+        think_positions = normalized_think_end_positions[sample_idx]
+        prev_end = -1
+        for step_idx, step_end in enumerate(think_positions):
+            if step_idx >= max_steps:
+                break
+            start = prev_end + 1
+            end = min(int(step_end) + 1, response_length)
+            if end <= start:
+                prev_end = int(step_end)
+                continue
+            advantages[sample_idx, start:end] = step_advantages[sample_idx, step_idx]
+            returns[sample_idx, start:end] = step_reward_tensor[sample_idx, step_idx]
+            prev_end = int(step_end)
+
+    advantages = advantages * response_mask
+    returns = returns * response_mask
+    return advantages, returns
 
 
 @register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")

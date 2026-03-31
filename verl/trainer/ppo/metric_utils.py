@@ -177,6 +177,25 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["num_turns/max"] = num_turns.max()
         metrics["num_turns/mean"] = num_turns.mean()
 
+    # step-aligned reward diagnostics
+    if "step_rewards" in batch.non_tensor_batch:
+        step_rewards_list = batch.non_tensor_batch["step_rewards"]
+        max_steps = max((len(sr) for sr in step_rewards_list if sr is not None and hasattr(sr, '__len__')), default=0)
+        for step_idx in range(max_steps):
+            step_vals = []
+            for sr in step_rewards_list:
+                if sr is not None and hasattr(sr, '__len__') and len(sr) > step_idx:
+                    step_vals.append(float(sr[step_idx]))
+            if step_vals:
+                metrics[f"step_reward/step_{step_idx}/mean"] = sum(step_vals) / len(step_vals)
+                metrics[f"step_reward/step_{step_idx}/hit_rate"] = sum(1.0 for v in step_vals if v > 0) / len(step_vals)
+    if "block_count_match" in batch.non_tensor_batch:
+        bcm = batch.non_tensor_batch["block_count_match"]
+        metrics["step_reward/block_count_match_rate"] = float(np.mean([bool(v) for v in bcm]))
+    if "sid_valid" in batch.non_tensor_batch:
+        sv = batch.non_tensor_batch["sid_valid"]
+        metrics["step_reward/sid_valid_rate"] = float(np.mean([bool(v) for v in sv]))
+
     return metrics
 
 
@@ -392,7 +411,7 @@ def process_validation_metrics(
     for data_source, prompt2var2vals in data_src2prompt2var2vals.items():
         for prompt, var2vals in prompt2var2vals.items():
             for var_name, var_vals in var2vals.items():
-                if isinstance(var_vals[0], str):
+                if not var_vals or not isinstance(var_vals[0], (int, float, bool)):
                     continue
 
                 metric = {}

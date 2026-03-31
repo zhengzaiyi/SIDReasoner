@@ -283,6 +283,10 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        if "step_rewards" in data.non_tensor_batch:  # optional
+            adv_kwargs["step_rewards"] = data.non_tensor_batch["step_rewards"]
+        if "think_end_positions" in data.non_tensor_batch:  # optional
+            adv_kwargs["think_end_positions"] = data.non_tensor_batch["think_end_positions"]
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
@@ -370,6 +374,7 @@ class RayPPOTrainer:
             self.use_critic = True
         elif self.config.algorithm.adv_estimator in [
             AdvantageEstimator.GRPO,
+            AdvantageEstimator.GRPO_STEP_ALIGNED,
             AdvantageEstimator.GRPO_PASSK,
             AdvantageEstimator.REINFORCE_PLUS_PLUS,
             AdvantageEstimator.REMAX,
@@ -1290,7 +1295,7 @@ class RayPPOTrainer:
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            batch.non_tensor_batch.update({k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:

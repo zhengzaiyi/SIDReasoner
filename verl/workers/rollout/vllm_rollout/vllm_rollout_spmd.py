@@ -53,6 +53,7 @@ from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
 from verl.utils.profiler import GPUMemoryLogger
+from verl.utils.reward_score.step_alignment import RecommendationStepAligner
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 
@@ -312,6 +313,18 @@ class vLLMRollout(BaseRollout):
             self.sid_beam_size = config['sid_beam_size']
             self.num_sid_tokens = config['sid_length']
 
+        self.enable_step_aligned_reasoning = bool(config.get("step_aligned_reasoning", False))
+        self.step_alignment = None
+        self.step_aligned_think_chunk_tokens = int(config.get("step_aligned_think_chunk_tokens", min(256, config.response_length)))
+        self.step_aligned_min_tokens_per_block = int(config.get("step_aligned_min_tokens_per_block", 1))
+        if self.enable_step_aligned_reasoning:
+            item_info_path = config.get("sid_item_info_path")
+            if not item_info_path:
+                raise ValueError("step_aligned_reasoning requires rollout.sid_item_info_path")
+            self.step_alignment = RecommendationStepAligner(tokenizer=tokenizer, item_info_path=item_info_path)
+            if self.activate_beam_search:
+                raise ValueError("step_aligned_reasoning is incompatible with sid_beam_size beam search")
+
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -328,6 +341,230 @@ class vLLMRollout(BaseRollout):
         # if len(old_sampling_params_args):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
+
+    def _build_sampling_params(self, **overrides) -> SamplingParams:
+        sampling_params = deepcopy(self.sampling_params)
+        for key, value in overrides.items():
+            setattr(sampling_params, key, value)
+        return sampling_params
+
+    def _select_lora_requests(self, lora_requests, indices):
+        if lora_requests is None:
+            return None
+        if isinstance(lora_requests, list):
+            return [lora_requests[index] for index in indices]
+        return lora_requests
+
+    def _extract_rollout_log_probs(self, token_ids, sample_logprobs) -> list[float]:
+        if not sample_logprobs:
+            return []
+        selected_log_probs = []
+        for token_idx, token_id in enumerate(token_ids):
+            token_logprobs = sample_logprobs[token_idx]
+            selected_log_probs.append(token_logprobs[token_id].logprob)
+        return selected_log_probs
+
+    def _append_generation_outputs(
+        self,
+        current_inputs: list[dict[str, Any]],
+        sample_indices: list[int],
+        outputs,
+        generated_tokens: list[list[int]],
+        rollout_log_probs: list[list[float]],
+        remaining_budget: list[int],
+    ) -> list[list[int]]:
+        appended_token_ids: list[list[int]] = []
+        for local_idx, output in enumerate(outputs):
+            sample_idx = sample_indices[local_idx]
+            sample_output = output.outputs[0]
+            token_ids = list(sample_output.token_ids)
+            appended_token_ids.append(token_ids)
+            if token_ids:
+                current_inputs[sample_idx]["prompt_token_ids"].extend(token_ids)
+                generated_tokens[sample_idx].extend(token_ids)
+                remaining_budget[sample_idx] = max(0, remaining_budget[sample_idx] - len(token_ids))
+                if self.config.calculate_log_probs:
+                    rollout_log_probs[sample_idx].extend(
+                        self._extract_rollout_log_probs(token_ids, sample_output.logprobs)
+                    )
+        return appended_token_ids
+
+    def _generate_step_aligned_responses(self, vllm_inputs, non_tensor_batch, lora_requests, eos_token_id):
+        batch_size = len(vllm_inputs)
+        current_inputs = []
+        for input_data in vllm_inputs:
+            copied_input = dict(input_data)
+            copied_input["prompt_token_ids"] = list(input_data["prompt_token_ids"])
+            current_inputs.append(copied_input)
+
+        generated_tokens = [[] for _ in range(batch_size)]
+        rollout_log_probs = [[] for _ in range(batch_size)]
+        remaining_budget = [int(self.config.response_length) for _ in range(batch_size)]
+
+        reward_models = non_tensor_batch.get("reward_model")
+        if reward_models is not None:
+            sid_lengths = []
+            for reward_model in reward_models:
+                ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else None
+                sid_lengths.append(self.step_alignment.sid_length_from_ground_truth(ground_truth))
+        else:
+            sid_lengths = [self.step_alignment.sid_length] * batch_size
+        max_sid_length = max(sid_lengths, default=self.step_alignment.sid_length)
+        completed_blocks = [0 for _ in range(batch_size)]
+
+        def run_generation(active_indices: list[int], sampling_params_per_request: list[SamplingParams]):
+            if not active_indices:
+                return []
+            return self.inference_engine.generate(
+                prompts=[current_inputs[index] for index in active_indices],
+                sampling_params=sampling_params_per_request,
+                lora_request=self._select_lora_requests(lora_requests, active_indices),
+                use_tqdm=False,
+            )
+
+        for block_idx in range(max_sid_length):
+            start_indices = [
+                index
+                for index in range(batch_size)
+                if sid_lengths[index] > block_idx and completed_blocks[index] == block_idx and remaining_budget[index] > 0
+            ]
+            if not start_indices:
+                continue
+
+            start_params = [
+                self._build_sampling_params(
+                    max_tokens=1,
+                    min_tokens=1,
+                    stop_token_ids=[],
+                    allowed_token_ids=[self.step_alignment.think_start_token_id],
+                )
+                for _ in start_indices
+            ]
+            start_outputs = run_generation(start_indices, start_params)
+            self._append_generation_outputs(
+                current_inputs,
+                start_indices,
+                start_outputs,
+                generated_tokens,
+                rollout_log_probs,
+                remaining_budget,
+            )
+
+            unfinished = [index for index in start_indices if remaining_budget[index] > 0]
+            while unfinished:
+                active_indices = []
+                active_params = []
+                for index in unfinished:
+                    max_tokens = min(self.step_aligned_think_chunk_tokens, remaining_budget[index])
+                    if max_tokens <= 0:
+                        continue
+                    active_indices.append(index)
+                    active_params.append(
+                        self._build_sampling_params(
+                            max_tokens=max_tokens,
+                            min_tokens=self.step_aligned_min_tokens_per_block,
+                            stop_token_ids=[self.step_alignment.think_end_token_id],
+                            allowed_token_ids=None,
+                        )
+                    )
+
+                if not active_indices:
+                    break
+
+                outputs = run_generation(active_indices, active_params)
+                appended = self._append_generation_outputs(
+                    current_inputs,
+                    active_indices,
+                    outputs,
+                    generated_tokens,
+                    rollout_log_probs,
+                    remaining_budget,
+                )
+
+                next_unfinished = []
+                for local_idx, sample_idx in enumerate(active_indices):
+                    token_ids = appended[local_idx]
+                    if not token_ids:
+                        continue
+                    last_token_id = token_ids[-1]
+                    if last_token_id == self.step_alignment.think_end_token_id:
+                        completed_blocks[sample_idx] += 1
+                        continue
+                    if last_token_id == eos_token_id or remaining_budget[sample_idx] <= 0:
+                        continue
+                    next_unfinished.append(sample_idx)
+                unfinished = next_unfinished
+
+        generated_sid_tokens = [[] for _ in range(batch_size)]
+        for sid_position in range(max_sid_length):
+            active_indices = [
+                index
+                for index in range(batch_size)
+                if sid_lengths[index] > sid_position
+                and completed_blocks[index] >= sid_lengths[index]
+                and remaining_budget[index] > 0
+            ]
+            if not active_indices:
+                continue
+
+            active_params = []
+            for index in active_indices:
+                allowed_token_ids = self.step_alignment.allowed_token_ids_for_prefix(
+                    sid_prefix=generated_sid_tokens[index],
+                    position=sid_position,
+                )
+                if not allowed_token_ids:
+                    continue
+                active_params.append(
+                    self._build_sampling_params(
+                        max_tokens=1,
+                        min_tokens=1,
+                        stop_token_ids=[],
+                        allowed_token_ids=allowed_token_ids,
+                    )
+                )
+
+            if len(active_params) != len(active_indices):
+                filtered_indices = []
+                filtered_params = []
+                for index in active_indices:
+                    allowed_token_ids = self.step_alignment.allowed_token_ids_for_prefix(
+                        sid_prefix=generated_sid_tokens[index],
+                        position=sid_position,
+                    )
+                    if not allowed_token_ids:
+                        continue
+                    filtered_indices.append(index)
+                    filtered_params.append(
+                        self._build_sampling_params(
+                            max_tokens=1,
+                            min_tokens=1,
+                            stop_token_ids=[],
+                            allowed_token_ids=allowed_token_ids,
+                        )
+                    )
+                active_indices = filtered_indices
+                active_params = filtered_params
+
+            if not active_indices:
+                continue
+
+            outputs = run_generation(active_indices, active_params)
+            appended = self._append_generation_outputs(
+                current_inputs,
+                active_indices,
+                outputs,
+                generated_tokens,
+                rollout_log_probs,
+                remaining_budget,
+            )
+            for local_idx, sample_idx in enumerate(active_indices):
+                token_ids = appended[local_idx]
+                generated_sid_tokens[sample_idx].extend(
+                    self.step_alignment.sid_tokens_from_token_ids(token_ids)
+                )
+
+        return generated_tokens, rollout_log_probs
 
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
@@ -423,32 +660,45 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
-            )
+            if self.enable_step_aligned_reasoning:
+                response, rollout_log_probs = self._generate_step_aligned_responses(
+                    vllm_inputs=vllm_inputs,
+                    non_tensor_batch=non_tensor_batch,
+                    lora_requests=lora_requests,
+                    eos_token_id=eos_token_id,
+                )
+                response_reasonings = []
+            else:
+                outputs = self.inference_engine.generate(
+                    prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                    sampling_params=self.sampling_params,
+                    lora_request=lora_requests,
+                    use_tqdm=False,
+                )
 
-            # TODO(sgm): disable logprob when recompute_log_prob is enable
-            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-            response = []
-            response_reasonings = []
-            rollout_log_probs = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
-                    # the generated responses are truncated at </think>\n\n
-                    response.append(response_ids)
-                    
-                    if self.activate_beam_search:
-                        response_ids_truncated = truncate_at_end_think(response_ids, marker=self.truncate_marker, clip_chars=20)
-                        response_reasonings.append(response_ids_truncated)
-                    if self.config.calculate_log_probs:
-                        curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
+                # TODO(sgm): disable logprob when recompute_log_prob is enable
+                # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+                response = []
+                response_reasonings = []
+                rollout_log_probs = []
+                for output in outputs:
+                    for sample_id in range(len(output.outputs)):
+                        response_ids = output.outputs[sample_id].token_ids
+                        # the generated responses are truncated at </think>\n\n
+                        response.append(response_ids)
+
+                        if self.activate_beam_search:
+                            response_ids_truncated = truncate_at_end_think(
+                                response_ids,
+                                marker=self.truncate_marker,
+                                clip_chars=20,
+                            )
+                            response_reasonings.append(response_ids_truncated)
+                        if self.config.calculate_log_probs:
+                            curr_log_prob = []
+                            for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                                curr_log_prob.append(logprob[response_ids[i]].logprob)
+                            rollout_log_probs.append(curr_log_prob)
 
             # response: list of token ids (bs * n, response_length)
             # next step: performance beam search for self.num_sid_tokens digits.

@@ -29,7 +29,7 @@ import torch.nn as nn
 import bitsandbytes as bnb
 """
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from data_Qwen3 import SidSFTDataset, SidItemFeatDataset, ReasoningActivationDataset
+from data_Qwen3 import SidSFTDataset, SidItemFeatDataset, ReasoningActivationDataset, StepAlignedReasoningActivationDataset
 import random
 from datasets import Dataset as HFDataset
 
@@ -205,6 +205,8 @@ def train(
     item_meta_path: str = "./data/Amazon/index/Office_Products.item.json",
     reasoning_train_file: str = "./data/Amazon/index/Office_Products.integrated_narrative.csv",
     train_new_token_embeddings_only: bool = False,
+    step_aligned_reasoning: bool = False,
+    sid_length: int = 0,
 ):
     set_seed(seed)
     os.environ['WANDB_PROJECT'] = wandb_project
@@ -291,11 +293,35 @@ def train(
     print(f"Trainable parameters: {trainable_params} / {total_params} ({percent:.4f}%)")
         
 
-    train_data = ReasoningActivationDataset(reasoning_train_file=reasoning_train_file, item_file=item_meta_path, index_file=sid_index_path, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
+    if step_aligned_reasoning:
+        train_data = StepAlignedReasoningActivationDataset(
+            reasoning_train_file=reasoning_train_file,
+            item_file=item_meta_path,
+            index_file=sid_index_path,
+            tokenizer=tokenizer,
+            max_len=cutoff_len,
+            sample=sample,
+            seed=seed,
+            category=category,
+            sid_length=sid_length,
+        )
+        dataset_name = "StepAlignedReasoningActivationDataset"
+    else:
+        train_data = ReasoningActivationDataset(
+            reasoning_train_file=reasoning_train_file,
+            item_file=item_meta_path,
+            index_file=sid_index_path,
+            tokenizer=tokenizer,
+            max_len=cutoff_len,
+            sample=sample,
+            seed=seed,
+            category=category,
+        )
+        dataset_name = "ReasoningActivationDataset"
     main_rank = int(os.environ.get("RANK", 0)) == 0 and int(os.environ.get("LOCAL_RANK", 0)) == 0
     if main_rank:
         train_dataset_names = [
-            "ReasoningActivationDataset",
+            dataset_name,
         ]
         for ds, name in zip([train_data], train_dataset_names):
             _preview_dataset(ds, name, tokenizer)

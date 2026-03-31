@@ -1,33 +1,30 @@
 #!/bin/bash
 
-# Tested successfully on the hiyouga/verl:ngc-th2.6.0-cu126-vllm0.8.4-flashinfer0.2.2-cxx11abi0 image.
-# It outperforms the Qwen2 7B base model by two percentage points on the test set of GSM8K.
-# export NCCL_P2P_DISABLE=1       # 禁用 NVLink
-# export NCCL_IB_DISABLE=1        # 禁用 InfiniBand
-# export NCCL_NET_GDR_LEVEL=0     # 禁用 GDR（GPU直连）
-# export CUDA_VISIBLE_DEVICES=4,5,6,7
-
 set -euo pipefail
 set -x
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 source ~/miniforge3/etc/profile.d/conda.sh
 conda activate rrec
 
-# ================================
-# Note: please change the number of GPUs and nodes according to your setup.
-# ================================
+NVIDIA_NCCL_LIB="$(python3 -c 'import nvidia.nccl; import os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), "lib"))' 2>/dev/null || true)"
+if [ -n "${NVIDIA_NCCL_LIB}" ] && [ -d "${NVIDIA_NCCL_LIB}" ]; then
+    export LD_LIBRARY_PATH="${NVIDIA_NCCL_LIB}:${LD_LIBRARY_PATH:-}"
+fi
+
 n_gpus_per_node=4
 nnodes=1
-experiment_name="Office_Products_stage3_rl_Qwen3-1.7B"
-stage2_checkpoint="./output_dir/Office_Products_stage2_reasoning_activation_Qwen3-1.7B/final_checkpoint"
-log_file="./logs/${experiment_name}.log"
-# ================================
+experiment_name="Office_Products_stage3_step_aligned_Qwen3-1.7B"
+stage2_checkpoint="./output_dir/Office_Products_stage2_step_aligned_reasoning_activation_Qwen3-1.7B/final_checkpoint"
+item_info_path="${SCRIPT_DIR}/data/Amazon/info/Office_Products_5_2016-10-2018-11.txt"
 
 mkdir -p ./logs
 
-{
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
+    algorithm.adv_estimator=grpo_step_aligned \
     data.train_files=./data/Amazon/rec_reasoning_verl/Office_Products/train.parquet \
     data.val_files=./data/Amazon/rec_reasoning_verl/Office_Products/test.parquet \
     data.train_batch_size=256 \
@@ -52,13 +49,20 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=16 \
+    +actor_rollout_ref.rollout.step_aligned_reasoning=True \
+    +actor_rollout_ref.rollout.sid_item_info_path="${item_info_path}" \
+    +actor_rollout_ref.rollout.step_aligned_think_chunk_tokens=256 \
+    +actor_rollout_ref.rollout.step_aligned_min_tokens_per_block=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    reward_model.reward_manager=step_aligned \
+    +reward_model.reward_kwargs.item_info_path="${item_info_path}" \
+    +reward_model.reward_kwargs.match_reward=1.0 \
+    +reward_model.reward_kwargs.format_reward=0.0 \
+    +reward_model.reward_kwargs.require_exact_think_blocks=True \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    custom_reward_function.path="./verl/utils/reward_score/direct_recommendation_StepRule_Office.py" \
-    custom_reward_function.name="rule_base_reward" \
     trainer.project_name='RecRL_Reasoning' \
     trainer.experiment_name="${experiment_name}" \
     trainer.n_gpus_per_node=$n_gpus_per_node \
@@ -66,4 +70,3 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=100 \
     trainer.test_freq=50 \
     trainer.total_epochs=10 "$@"
-}

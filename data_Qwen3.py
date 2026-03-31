@@ -1,4 +1,5 @@
 import pandas as pd
+import re
 import torch
 from torch.utils.data import Dataset
 import numpy as np
@@ -1564,6 +1565,113 @@ Can you recommend the next item for the user based on their interaction history?
         return self.pre(idx)
 
 
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+|\n+')
+
+
+def split_into_n_segments(text: str, n: int) -> list:
+    """Split text into n roughly equal segments by sentence boundaries."""
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
+    if not sentences:
+        return [""] * n
+    if len(sentences) <= n:
+        segments = list(sentences)
+        while len(segments) < n:
+            segments.append("")
+        return segments
+    base_count = len(sentences) // n
+    remainder = len(sentences) % n
+    segments = []
+    start = 0
+    for i in range(n):
+        count = base_count + (1 if i < remainder else 0)
+        segment_sentences = sentences[start:start + count]
+        segments.append(" ".join(segment_sentences))
+        start += count
+    return segments
+
+
+def _count_sid_tokens(sid_str: str) -> int:
+    """Count the number of SID tokens like <a_X>, <b_Y>, <c_Z> in a string."""
+    return len(re.findall(r'<[^>]+>', sid_str))
+
+
+class StepAlignedReasoningActivationDataset(ReasoningActivationDataset):
+    """Reasoning activation dataset that produces len(SID) think blocks.
+
+    Each think block contains a roughly equal portion of the reasoning text.
+    All SID tokens are emitted after the final </think>.
+    """
+
+    def __init__(self, *args, sid_length: int = 0, **kwargs):
+        self.forced_sid_length = sid_length
+        super().__init__(*args, **kwargs)
+
+    def _get_sid_length(self, target_sid: str) -> int:
+        if self.forced_sid_length > 0:
+            return self.forced_sid_length
+        return _count_sid_tokens(target_sid)
+
+    def pre(self, idx):
+        instruction = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+Can you recommend the next item for the user based on their interaction history?
+"""
+        history_data = self.get_history(self.data.iloc[idx])
+        if history_data is None:
+            return None
+
+        if self.dedup and history_data['dedup']:
+            return None
+
+        prompt = self.generate_prompt_title(history_data['history_str'])
+        target = history_data['target_sid']
+        reasoning = history_data['reasoning'].strip()
+        sid_length = self._get_sid_length(target)
+
+        if sid_length <= 1:
+            assistant_response = f"<think>\n{reasoning}\n</think>\n\n{target}"
+        else:
+            segments = split_into_n_segments(reasoning, sid_length)
+            think_blocks = "\n".join(
+                f"<think>\n{seg.strip()}\n</think>" if seg.strip()
+                else "<think>\n\n</think>"
+                for seg in segments
+            )
+            assistant_response = f"{think_blocks}\n{target}"
+
+        formatted_prompt = self.generate_formatted_prompt(prompt, "")
+
+        # Build prefix (system + user + generation prompt) via chat template,
+        # then manually append the assistant response to avoid the template
+        # collapsing multiple <think> blocks into one.
+        prefix_messages = [
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": formatted_prompt},
+        ]
+        prefix_text = self.tokenizer.apply_chat_template(
+            prefix_messages, add_generation_prompt=True, tokenize=False,
+        )
+        prefix_ids = self.tokenizer.encode(prefix_text, add_special_tokens=False)
+        prefix_len = len(prefix_ids)
+
+        response_ids = self.tokenizer.encode(assistant_response, add_special_tokens=False)
+        eos_ids = [self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id is not None else []
+
+        full_ids = prefix_ids + response_ids + eos_ids
+        total_len = len(full_ids)
+
+        labels = [-100] * prefix_len + full_ids[prefix_len:]
+        attention_mask = [1] * total_len
+
+        if total_len > self.max_len:
+            full_ids = full_ids[-self.max_len:]
+            attention_mask = attention_mask[-self.max_len:]
+            labels = labels[-self.max_len:]
+
+        return {
+            "input_ids": full_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
 
 
 # This dataset is used for reasoning recommendation task.
