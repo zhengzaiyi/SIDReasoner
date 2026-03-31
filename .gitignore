@@ -17,3 +17,5 @@ logs/*
 data_backup/*
 data/*
 rq/*
+checkpoints/
+outputs/

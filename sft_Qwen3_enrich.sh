@@ -44,4 +44,4 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node 4 \
     --llm_generated_sequence_path "./data/Amazon/index/${CATEGORY}.integrated_narrative.csv" \
     --general_reasoning_path "./data/Amazon/general/sampled_data.arrow" \
     --mask_assistant True
-} > "${LOG_FILE}" 2>&1
+}

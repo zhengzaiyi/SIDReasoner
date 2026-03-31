@@ -41,4 +41,4 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node 4 --master_port 29519 \
     --item_meta_path "./data/Amazon/index/${CATEGORY}.item.json" \
     --reasoning_train_file "./data/Amazon/index/${CATEGORY}.integrated_narrative.csv" \
     --train_new_token_embeddings_only False
-} > "${LOG_FILE}" 2>&1
+}

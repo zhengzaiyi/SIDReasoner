@@ -13,6 +13,11 @@ set -x
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+NVIDIA_NCCL_LIB="$(python3 -c 'import nvidia.nccl; import os; print(os.path.join(os.path.dirname(nvidia.nccl.__file__), "lib"))' 2>/dev/null || true)"
+if [ -n "${NVIDIA_NCCL_LIB}" ] && [ -d "${NVIDIA_NCCL_LIB}" ]; then
+    export LD_LIBRARY_PATH="${NVIDIA_NCCL_LIB}:${LD_LIBRARY_PATH:-}"
+fi
+
 # ================================
 # Note: please change the number of GPUs and nodes according to your setup.
 # ================================
@@ -66,4 +71,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=100 \
     trainer.test_freq=50 \
     trainer.total_epochs=10 "$@"
-} > "${log_file}" 2>&1
+}
