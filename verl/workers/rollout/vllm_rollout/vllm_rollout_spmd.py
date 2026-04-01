@@ -317,6 +317,7 @@ class vLLMRollout(BaseRollout):
         self.step_alignment = None
         self.step_aligned_think_chunk_tokens = int(config.get("step_aligned_think_chunk_tokens", min(256, config.response_length)))
         self.step_aligned_min_tokens_per_block = int(config.get("step_aligned_min_tokens_per_block", 1))
+        self.step_aligned_constrained_sid = bool(config.get("step_aligned_constrained_sid", True))
         if self.enable_step_aligned_reasoning:
             item_info_path = config.get("sid_item_info_path")
             if not item_info_path:
@@ -411,6 +412,14 @@ class vLLMRollout(BaseRollout):
             sid_lengths = [self.step_alignment.sid_length] * batch_size
         max_sid_length = max(sid_lengths, default=self.step_alignment.sid_length)
         completed_blocks = [0 for _ in range(batch_size)]
+        newline_token_id = self.tokenizer.encode("\n", add_special_tokens=False)[-1]
+
+        def _inject_token(sample_idx: int, token_id: int):
+            current_inputs[sample_idx]["prompt_token_ids"].append(token_id)
+            generated_tokens[sample_idx].append(token_id)
+            remaining_budget[sample_idx] = max(0, remaining_budget[sample_idx] - 1)
+            if self.config.calculate_log_probs:
+                rollout_log_probs[sample_idx].append(0.0)
 
         def run_generation(active_indices: list[int], sampling_params_per_request: list[SamplingParams]):
             if not active_indices:
@@ -489,44 +498,27 @@ class vLLMRollout(BaseRollout):
                     last_token_id = token_ids[-1]
                     if last_token_id == self.step_alignment.think_end_token_id:
                         completed_blocks[sample_idx] += 1
+                        _inject_token(sample_idx, newline_token_id)
                         continue
                     if last_token_id == eos_token_id or remaining_budget[sample_idx] <= 0:
                         continue
                     next_unfinished.append(sample_idx)
                 unfinished = next_unfinished
 
-        generated_sid_tokens = [[] for _ in range(batch_size)]
-        for sid_position in range(max_sid_length):
-            active_indices = [
-                index
-                for index in range(batch_size)
-                if sid_lengths[index] > sid_position
-                and completed_blocks[index] >= sid_lengths[index]
-                and remaining_budget[index] > 0
-            ]
-            if not active_indices:
-                continue
-
-            active_params = []
-            for index in active_indices:
-                allowed_token_ids = self.step_alignment.allowed_token_ids_for_prefix(
-                    sid_prefix=generated_sid_tokens[index],
-                    position=sid_position,
-                )
-                if not allowed_token_ids:
+        if self.step_aligned_constrained_sid:
+            generated_sid_tokens = [[] for _ in range(batch_size)]
+            for sid_position in range(max_sid_length):
+                active_indices = [
+                    index
+                    for index in range(batch_size)
+                    if sid_lengths[index] > sid_position
+                    and completed_blocks[index] >= sid_lengths[index]
+                    and remaining_budget[index] > 0
+                ]
+                if not active_indices:
                     continue
-                active_params.append(
-                    self._build_sampling_params(
-                        max_tokens=1,
-                        min_tokens=1,
-                        stop_token_ids=[],
-                        allowed_token_ids=allowed_token_ids,
-                    )
-                )
 
-            if len(active_params) != len(active_indices):
-                filtered_indices = []
-                filtered_params = []
+                active_params = []
                 for index in active_indices:
                     allowed_token_ids = self.step_alignment.allowed_token_ids_for_prefix(
                         sid_prefix=generated_sid_tokens[index],
@@ -534,8 +526,7 @@ class vLLMRollout(BaseRollout):
                     )
                     if not allowed_token_ids:
                         continue
-                    filtered_indices.append(index)
-                    filtered_params.append(
+                    active_params.append(
                         self._build_sampling_params(
                             max_tokens=1,
                             min_tokens=1,
@@ -543,25 +534,76 @@ class vLLMRollout(BaseRollout):
                             allowed_token_ids=allowed_token_ids,
                         )
                     )
-                active_indices = filtered_indices
-                active_params = filtered_params
 
-            if not active_indices:
-                continue
+                if len(active_params) != len(active_indices):
+                    filtered_indices = []
+                    filtered_params = []
+                    for index in active_indices:
+                        allowed_token_ids = self.step_alignment.allowed_token_ids_for_prefix(
+                            sid_prefix=generated_sid_tokens[index],
+                            position=sid_position,
+                        )
+                        if not allowed_token_ids:
+                            continue
+                        filtered_indices.append(index)
+                        filtered_params.append(
+                            self._build_sampling_params(
+                                max_tokens=1,
+                                min_tokens=1,
+                                stop_token_ids=[],
+                                allowed_token_ids=allowed_token_ids,
+                            )
+                        )
+                    active_indices = filtered_indices
+                    active_params = filtered_params
 
-            outputs = run_generation(active_indices, active_params)
-            appended = self._append_generation_outputs(
-                current_inputs,
-                active_indices,
-                outputs,
-                generated_tokens,
-                rollout_log_probs,
-                remaining_budget,
-            )
-            for local_idx, sample_idx in enumerate(active_indices):
-                token_ids = appended[local_idx]
-                generated_sid_tokens[sample_idx].extend(
-                    self.step_alignment.sid_tokens_from_token_ids(token_ids)
+                if not active_indices:
+                    continue
+
+                outputs = run_generation(active_indices, active_params)
+                appended = self._append_generation_outputs(
+                    current_inputs,
+                    active_indices,
+                    outputs,
+                    generated_tokens,
+                    rollout_log_probs,
+                    remaining_budget,
+                )
+                for local_idx, sample_idx in enumerate(active_indices):
+                    token_ids = appended[local_idx]
+                    generated_sid_tokens[sample_idx].extend(
+                        self.step_alignment.sid_tokens_from_token_ids(token_ids)
+                    )
+        else:
+            active_indices = [
+                index
+                for index in range(batch_size)
+                if completed_blocks[index] >= sid_lengths[index]
+                and remaining_budget[index] > 0
+            ]
+            if active_indices:
+                max_sid_tokens = max_sid_length
+                if eos_token_id is not None:
+                    _stop_ids = list(eos_token_id) if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
+                else:
+                    _stop_ids = []
+                free_params = [
+                    self._build_sampling_params(
+                        max_tokens=max_sid_tokens,
+                        min_tokens=max_sid_tokens,
+                        stop_token_ids=_stop_ids,
+                        allowed_token_ids=None,
+                    )
+                    for _ in active_indices
+                ]
+                outputs = run_generation(active_indices, free_params)
+                self._append_generation_outputs(
+                    current_inputs,
+                    active_indices,
+                    outputs,
+                    generated_tokens,
+                    rollout_log_probs,
+                    remaining_budget,
                 )
 
         return generated_tokens, rollout_log_probs

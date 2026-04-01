@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
+# export CUDA_VISIBLE_DEVICES=4,5,6,7
 source ~/miniforge3/etc/profile.d/conda.sh
 conda activate rrec
 
@@ -20,6 +21,9 @@ nnodes=1
 experiment_name="Office_Products_stage3_step_aligned_Qwen3-1.7B"
 stage2_checkpoint="./output_dir/Office_Products_stage2_step_aligned_reasoning_activation_Qwen3-1.7B/final_checkpoint"
 item_info_path="${SCRIPT_DIR}/data/Amazon/info/Office_Products_5_2016-10-2018-11.txt"
+
+# TRAIN_MODE: auto (default, resume if checkpoint exists) | scratch (always start fresh)
+TRAIN_MODE="${TRAIN_MODE:-disable}"
 
 mkdir -p ./logs
 
@@ -58,7 +62,7 @@ python3 -m verl.trainer.main_ppo \
     reward_model.reward_manager=step_aligned \
     +reward_model.reward_kwargs.item_info_path="${item_info_path}" \
     +reward_model.reward_kwargs.match_reward=1.0 \
-    +reward_model.reward_kwargs.format_reward=0.0 \
+    +reward_model.reward_kwargs.format_reward=0.2 \
     +reward_model.reward_kwargs.require_exact_think_blocks=True \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
@@ -69,4 +73,15 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=$nnodes \
     trainer.save_freq=100 \
     trainer.test_freq=50 \
-    trainer.total_epochs=10 "$@"
+    trainer.total_epochs=10 \
+    trainer.resume_mode="${TRAIN_MODE}" "$@"
+
+# --- original step-aligned reward config (backup) ---
+#   reward_model.reward_manager=step_aligned \
+#   +reward_model.reward_kwargs.item_info_path="${item_info_path}" \
+#   +reward_model.reward_kwargs.match_reward=1.0 \
+#   +reward_model.reward_kwargs.format_reward=0.0 \
+#   +reward_model.reward_kwargs.require_exact_think_blocks=True \
+
+# custom_reward_function.path="./verl/utils/reward_score/direct_recommendation_StepRule_Office.py" \
+# custom_reward_function.name="rule_base_reward" \

@@ -65,5 +65,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=$nnodes \
     trainer.save_freq=100 \
     trainer.test_freq=50 \
-    trainer.total_epochs=10 "$@"
+    trainer.total_epochs=10 \
+    trainer.resume_mode="disable" "$@"
 }

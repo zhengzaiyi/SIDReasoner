@@ -139,15 +139,20 @@ class MyRewardComputer:
         solution_str: str,
         ground_truth: str,
         extra_info: dict | None = None,
-    ) -> float:
-        # breakpoint()
+    ) -> dict:
         answer = extract_solution(solution_str=solution_str)
         ground_truth = extract_sid_tokens(ground_truth)[:3]
 
         if answer is None:
-            return 0
-        else:
-            return calculate_reward(answer, ground_truth) + 0.1 * calculate_format_reward(answer, self.sid_hash)
+            return {"score": 0.0, "match_reward": 0.0, "format_reward": 0.0}
+
+        match_r = calculate_reward(answer, ground_truth)
+        format_r = calculate_format_reward(answer, self.sid_hash)
+        return {
+            "score": match_r + 0.1 * format_r,
+            "match_reward": match_r,
+            "format_reward": float(format_r),
+        }
 
 
 
@@ -163,6 +168,6 @@ def _get_reward_computer() -> MyRewardComputer:
 
 
 # ---- 暴露给 VERL 的函数接口 ----
-def rule_base_reward(data_source, solution_str, ground_truth, extra_info=None):
+def rule_base_reward(data_source, solution_str, ground_truth, extra_info=None) -> dict:
     rc = _get_reward_computer()
     return rc.compute(data_source, solution_str, ground_truth, extra_info)
